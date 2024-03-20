@@ -46,11 +46,6 @@ func removeDuplicate[T comparable](sliceList []T) []T {
 	return list
 }
 
-func main() {
-	result := HTTProbe([]string{"amazon.com", "zoom.com"})
-	fmt.Println(result)
-}
-
 func HTTProbe(domains []string) []string {
 	options := CreateDefaultOptions(domains)
 
