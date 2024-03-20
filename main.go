@@ -1,15 +1,12 @@
 package main
 
 import (
-	"bufio"
 	"crypto/tls"
-	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
-	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -17,45 +14,48 @@ import (
 
 type probeArgs []string
 
-func (p *probeArgs) Set(val string) error {
-	*p = append(*p, val)
-	return nil
-}
-
 func (p probeArgs) String() string {
 	return strings.Join(p, ",")
 }
 
+// ChanToSlice reads all data from ch (which must be a chan), returning a
+// slice of the data. If ch is a 'T chan' then the return value is of type
+// []T inside the returned interface.
+// A typical call would be sl := ChanToSlice(ch).([]int)
+func ChanToSlice(ch interface{}) interface{} {
+	chv := reflect.ValueOf(ch)
+	slv := reflect.MakeSlice(reflect.SliceOf(reflect.TypeOf(ch).Elem()), 0, 0)
+	for {
+		v, ok := chv.Recv()
+		if !ok {
+			return slv.Interface()
+		}
+		slv = reflect.Append(slv, v)
+	}
+}
+
+func removeDuplicate[T comparable](sliceList []T) []T {
+	allKeys := make(map[T]bool)
+	list := []T{}
+	for _, item := range sliceList {
+		if _, value := allKeys[item]; !value {
+			allKeys[item] = true
+			list = append(list, item)
+		}
+	}
+	return list
+}
+
 func main() {
+	result := HTTProbe([]string{"amazon.com", "zoom.com"})
+	fmt.Println(result)
+}
 
-	// concurrency flag
-	var concurrency int
-	flag.IntVar(&concurrency, "c", 20, "set the concurrency level (split equally between HTTPS and HTTP requests)")
-
-	// probe flags
-	var probes probeArgs
-	flag.Var(&probes, "p", "add additional probe (proto:port)")
-
-	// skip default probes flag
-	var skipDefault bool
-	flag.BoolVar(&skipDefault, "s", false, "skip the default probes (http:80 and https:443)")
-
-	// timeout flag
-	var to int
-	flag.IntVar(&to, "t", 10000, "timeout (milliseconds)")
-
-	// prefer https
-	var preferHTTPS bool
-	flag.BoolVar(&preferHTTPS, "prefer-https", false, "only try plain HTTP if HTTPS fails")
-
-	// HTTP method to use
-	var method string
-	flag.StringVar(&method, "method", "GET", "HTTP method to use")
-
-	flag.Parse()
+func HTTProbe(domains []string) []string {
+	options := CreateDefaultOptions(domains)
 
 	// make an actual time.Duration out of the timeout
-	timeout := time.Duration(to * 1000000)
+	timeout := time.Duration(options.to * 1000000)
 
 	var tr = &http.Transport{
 		MaxIdleConns:      30,
@@ -88,19 +88,20 @@ func main() {
 
 	// HTTPS workers
 	var httpsWG sync.WaitGroup
-	for i := 0; i < concurrency/2; i++ {
+	for i := 0; i < options.concurrency/2; i++ {
 		httpsWG.Add(1)
 
 		go func() {
 			for url := range httpsURLs {
 
 				// always try HTTPS first
-				withProto := "https://" + url
-				if isListening(client, withProto, method) {
-					output <- withProto
+				protocol := "https://"
+				withProto := protocol + url
+				if isListening(client, withProto, options.method) {
+					output <- strings.TrimPrefix(withProto, protocol)
 
 					// skip trying HTTP if --prefer-https is set
-					if preferHTTPS {
+					if options.preferHTTPS {
 						continue
 					}
 				}
@@ -114,14 +115,15 @@ func main() {
 
 	// HTTP workers
 	var httpWG sync.WaitGroup
-	for i := 0; i < concurrency/2; i++ {
+	for i := 0; i < options.concurrency/2; i++ {
 		httpWG.Add(1)
 
 		go func() {
 			for url := range httpURLs {
-				withProto := "http://" + url
-				if isListening(client, withProto, method) {
-					output <- withProto
+				protocol := "http://"
+				withProto := protocol + url
+				if isListening(client, withProto, options.method) {
+					output <- strings.TrimPrefix(withProto, protocol)
 					continue
 				}
 			}
@@ -136,29 +138,16 @@ func main() {
 		close(httpURLs)
 	}()
 
-	// Output worker
-	var outputWG sync.WaitGroup
-	outputWG.Add(1)
-	go func() {
-		for o := range output {
-			fmt.Println(o)
-		}
-		outputWG.Done()
-	}()
-
 	// Close the output channel when the HTTP workers are done
 	go func() {
 		httpWG.Wait()
 		close(output)
 	}()
 
-	// accept domains on stdin
-	sc := bufio.NewScanner(os.Stdin)
-	for sc.Scan() {
-		domain := strings.ToLower(sc.Text())
+	for _, domain := range options.domains {
 
 		// submit standard port checks
-		if !skipDefault {
+		if !options.skipDefault {
 			httpsURLs <- domain
 		}
 
@@ -167,7 +156,7 @@ func main() {
 		large := []string{"81", "591", "2082", "2087", "2095", "2096", "3000", "8000", "8001", "8008", "8080", "8083", "8443", "8834", "8888"}
 
 		// submit any additional proto:port probes
-		for _, p := range probes {
+		for _, p := range options.probes {
 			switch p {
 			case "xlarge":
 				for _, port := range xlarge {
@@ -201,13 +190,7 @@ func main() {
 	// doing and then call 'Done' on the WaitGroup
 	close(httpsURLs)
 
-	// check there were no errors reading stdin (unlikely)
-	if err := sc.Err(); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to read input: %s\n", err)
-	}
-
-	// Wait until the output waitgroup is done
-	outputWG.Wait()
+	return removeDuplicate(ChanToSlice(output).([]string))
 }
 
 func isListening(client *http.Client, url, method string) bool {
@@ -222,7 +205,7 @@ func isListening(client *http.Client, url, method string) bool {
 
 	resp, err := client.Do(req)
 	if resp != nil {
-		io.Copy(ioutil.Discard, resp.Body)
+		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 	}
 
