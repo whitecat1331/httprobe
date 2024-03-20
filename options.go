@@ -1,4 +1,4 @@
-package main
+package httprobe
 
 type Options struct {
 	domains     []string

@@ -1,4 +1,4 @@
-package main
+package httprobe
 
 import (
 	"crypto/tls"
